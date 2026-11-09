@@ -1,0 +1,549 @@
+logLevel: info
+logTimeFormat: "rfc3339"
+healthCheckTimeout: 300
+
+models:
+# =========================================================================
+# RAG Models
+# =========================================================================
+  Embedding-Gemma-2:
+    env:
+      - "HSA_OVERRIDE_GFX_VERSION=11.5.1"
+      - "HIP_VISIBLE_DEVICES=0"
+      - "ROCBLAS_USE_HIPBLASLT=1"
+      - "GGML_CUDA_ENABLE_UNIFIED_MEMORY=1"
+      - "LD_LIBRARY_PATH=/usr/local/lib/llama/rocm:/opt/rocm/lib:/usr/lib/x86_64-linux-gnu"
+    cmd: |
+      gufo serve \
+       embeddings \
+      --model ./models/google/embedding-gemma-2
+      --host 0.0.0.0 \
+      --port ${PORT}
+        
+  Qwen3-Embedding-8B-Q8_0:
+    env:
+      - "HSA_OVERRIDE_GFX_VERSION=11.5.1"
+      - "HIP_VISIBLE_DEVICES=0"
+      - "ROCBLAS_USE_HIPBLASLT=1"
+      - "GGML_CUDA_ENABLE_UNIFIED_MEMORY=1"
+      - "LD_LIBRARY_PATH=/usr/local/lib/llama/rocm:/opt/rocm/lib:/usr/lib/x86_64-linux-gnu"
+    cmd: |
+      llama-server-rocm \
+      --model /models/Qwen/Qwen3-Embedding-8B-Q8_0.gguf \
+      --pooling last \
+      --embeddings \
+      --metrics \
+      --n-gpu-layers 99 \
+      --ctx-size 8192 \
+      --batch-size 4096 \
+      --ubatch-size 4096 \
+      --parallel 1 \
+      --cache-ram 0 \
+      --load-mode mlock \
+      --host 0.0.0.0 \
+      --port ${PORT}
+    ttl: 300 
+
+  Qwen3-Reranker-8B.Q8_0:
+    env:
+      - "HSA_OVERRIDE_GFX_VERSION=11.5.1"
+      - "HIP_VISIBLE_DEVICES=0"
+      - "ROCBLAS_USE_HIPBLASLT=1"
+      - "GGML_CUDA_ENABLE_UNIFIED_MEMORY=1"
+      - "LD_LIBRARY_PATH=/usr/local/lib/llama/rocm:/opt/rocm/lib:/usr/lib/x86_64-linux-gnu"
+    cmd: |
+      llama-server-rocm \
+      --model /models/Voodisss/Qwen3-Reranker-8B.Q8_0.gguf \
+      --reranking \
+      --pooling rank \
+      --embeddings \
+      --metrics \
+      --n-gpu-layers 99 \
+      --ctx-size 32768 \
+      --flash-attn on \
+      --batch-size 8192 \
+      --ubatch-size 8192 \
+      --parallel 1 \
+      --cache-ram 0 \
+      --load-mode mlock \
+      --host 0.0.0.0 \
+      --port ${PORT}
+    ttl: 300
+
+# =========================================================================
+#  Large LLMs
+# =========================================================================
+
+  # ---------- Gufo (native Strix Halo engine) ----------
+  Arete-27B:
+    name: "Arete-27B (Gufo)"
+    env:
+      - "HSA_OVERRIDE_GFX_VERSION=11.5.1"
+      - "HIP_VISIBLE_DEVICES=0"
+    cmd: |
+      gufo serve \
+        --host 127.0.0.1 \
+        --port ${PORT} \
+        llm \
+        --model /models/AtomicChat/Arete-27B-Q8_0.gguf \
+        --mmproj /models/AtomicChat/Arete-27B-mmproj-BF16.gguf \
+        --served-model-name Arete-27B \
+        --context 262144 \
+        --sessions 3 \           
+        --temperature 1.0 \
+        --top-p 0.95 \
+        --top-k 20 \
+        --min-p 0.0 \
+        --presence-penalty 0.0 \
+        --repeat-penalty 1.0 
+    checkEndpoint: /health
+    ttl: 120
+
+
+  Qwen3.8-27B:
+    name: "Qwen3.8 27B (Gufo)"
+    env:
+      - "HSA_OVERRIDE_GFX_VERSION=11.5.1"
+      - "HIP_VISIBLE_DEVICES=0"
+    cmd: |
+      gufo serve \
+        --host 127.0.0.1 \
+        --port ${PORT} \
+        llm \
+        --model /models/unsloth/Qwen3.8-27B-UD-Q8_K_XL.gguf \
+        --speculative dflash2 \
+        --dflash-model /models/z-lab/Qwen3.8-27B-DFlash2-Q8_0.gguf \
+        --mmproj /models/unsloth/Qwen3.8-27B-mmproj-BF16.gguf \
+        --served-model-name Qwen3.8-27B \
+        --context 262144 \
+        --sessions 2 \           
+        --temperature 1.0 \
+        --top-p 0.95 \
+        --top-k 20 \
+        --min-p 0.0 \
+        --presence-penalty 0.0 \
+        --repeat-penalty 1.0 
+    checkEndpoint: /health
+    ttl: 120
+
+  Qwen3.8-Flash-Next:
+    name: "Qwen3.8 Flash Next (Gufo)"
+    env:
+      - "HSA_OVERRIDE_GFX_VERSION=11.5.1"
+      - "HIP_VISIBLE_DEVICES=0"
+    cmd: |
+      gufo serve \
+        --host 127.0.0.1 \
+        --port ${PORT} \
+        llm \
+        --model /models/unsloth/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
+        --speculative mtp \
+        --mtp-model /models/unsloth/Qwen3.8-Flash-Next-Q8_0-mtp.gguf \
+        --served-model-name Qwen3.8-Flash-Next \
+        --context 131072 \
+        --sessions 2 \
+        --prefill-chunk 1024 \
+        --temperature 1.0 \
+        --top-p 0.95 \
+        --top-k 20 \
+        --min-p 0.0 \
+        --presence-penalty 0.0 \
+        --repeat-penalty 1.0
+    checkEndpoint: /health
+    ttl: 120
+
+  # ---------- llama.cpp / ROCm (everything Gufo does not support) ----------
+  Ripple-65B-Preview:
+    env:
+      - "HSA_OVERRIDE_GFX_VERSION=11.5.1"
+      - "HIP_VISIBLE_DEVICES=0"
+      - "ROCBLAS_USE_HIPBLASLT=1"
+      - "GGML_CUDA_ENABLE_UNIFIED_MEMORY=1"
+      - "LD_LIBRARY_PATH=/usr/local/lib/llama/rocm:/opt/rocm/lib:/usr/lib/x86_64-linux-gnu"
+    cmd: |
+      llama-server-rocm \
+        --model /models/AtomicChat/Ripple-65B-Preview-Q8_0-00001-of-00002.gguf \
+        --jinja \
+        --ctx-size 262144 \
+        --flash-attn on \
+        --n-gpu-layers 99 \
+        --host 0.0.0.0 \
+        --port ${PORT}
+
+  gemma-4-31B:
+    env:
+      - "HSA_OVERRIDE_GFX_VERSION=11.5.1"
+      - "HIP_VISIBLE_DEVICES=0"
+      - "ROCBLAS_USE_HIPBLASLT=1"
+      - "GGML_CUDA_ENABLE_UNIFIED_MEMORY=1"
+      - "LD_LIBRARY_PATH=/usr/local/lib/llama/rocm:/opt/rocm/lib:/usr/lib/x86_64-linux-gnu"
+    cmd: |
+      llama-server-rocm \
+        --model /models/unsloth/gemma-4-31B-it-Q8_0.gguf \
+        --mmproj /models/unsloth/gemma-4-31B-it-mmproj-F16.gguf \
+        --model-draft /models/unsloth/gemma-4-31B-it-Q8_0-mtp.gguf \
+        --spec-type draft-mtp \
+        --spec-draft-n-max 3 \
+        --spec-draft-adaptive \
+        --n-gpu-layers 99 \
+        --n-gpu-layers-draft 99 \
+        --ctx-size 262144 \
+        --flash-attn on \
+        --batch-size 1024 \
+        --ubatch-size 1024 \
+        --threads 4 \
+        --threads-batch 4 \
+        --parallel 1 \
+        --cache-type-k q8_0 \
+        --cache-type-v q8_0 \
+        --host 0.0.0.0 \
+        --port ${PORT}
+    ttl: 120
+
+  MeroMero:
+    env:
+      - "HSA_OVERRIDE_GFX_VERSION=11.5.1"
+      - "HIP_VISIBLE_DEVICES=0"
+      - "ROCBLAS_USE_HIPBLASLT=1"
+      - "GGML_CUDA_ENABLE_UNIFIED_MEMORY=1"
+      - "LD_LIBRARY_PATH=/usr/local/lib/llama/rocm:/opt/rocm/lib:/usr/lib/x86_64-linux-gnu"
+    cmd: |
+      llama-server-rocm \
+        --model /models/llmfan46/G4-MeroMero-31B-uncensored-heretic-Q8_0.gguf \
+        --mmproj /models/llmfan46/G4-MeroMero-31B-uncensored-heretic-mmproj-BF16.gguf \
+        --model-draft /models/unsloth/gemma-4-31B-it-Q8_0-mtp.gguf \
+        --spec-type draft-mtp \
+        --spec-draft-n-max 3 \
+        --spec-draft-adaptive \
+        --n-gpu-layers 99 \
+        --n-gpu-layers-draft 99 \
+        --temp 1.12 --min-p 0.08 --top-p 1.0 --top-k 0 \
+        --ctx-size 262144 \
+        --flash-attn on \
+        --batch-size 1024 \
+        --ubatch-size 1024 \
+        --threads 4 \
+        --threads-batch 4 \
+        --parallel 1 \
+        --cache-type-k q8_0 \
+        --cache-type-v q8_0 \
+        --host 0.0.0.0 \
+        --port ${PORT}
+    ttl: 120
+
+  gemma-4-26B-A4B:
+    env:
+      - "HSA_OVERRIDE_GFX_VERSION=11.5.1"
+      - "HIP_VISIBLE_DEVICES=0"
+      - "ROCBLAS_USE_HIPBLASLT=1"
+      - "GGML_CUDA_ENABLE_UNIFIED_MEMORY=1"
+      - "LD_LIBRARY_PATH=/usr/local/lib/llama/rocm:/opt/rocm/lib:/usr/lib/x86_64-linux-gnu"
+    cmd: |
+      llama-server-rocm \
+        --model /models/unsloth/gemma-4-26B-A4B-it-Q8_0.gguf \
+        --mmproj /models/unsloth/gemma-4-26B-A4B-it-mmproj-F16.gguf \
+        --model-draft /models/unsloth/gemma-4-26B-A4B-it-Q8_0-mtp.gguf \
+        --spec-type draft-mtp \
+        --spec-draft-n-max 3 \
+        --spec-draft-adaptive \
+        --n-gpu-layers 99 \
+        --n-gpu-layers-draft 99 \
+        --ctx-size 262144 \
+        --flash-attn on \
+        --batch-size 4096 \
+        --ubatch-size 2048 \
+        --threads 8 \
+        --threads-batch 8 \
+        --parallel 1 \
+        --cache-type-k q8_0 \
+        --cache-type-v q8_0 \
+        --load-mode mlock \
+        --host 0.0.0.0 \
+        --port ${PORT}
+    ttl: 120
+
+  Qwen3.6-35B-A3B:
+    env:
+      - "HSA_OVERRIDE_GFX_VERSION=11.5.1"
+      - "HIP_VISIBLE_DEVICES=0"
+      - "ROCBLAS_USE_HIPBLASLT=1"
+      - "GGML_CUDA_ENABLE_UNIFIED_MEMORY=1"
+      - "LD_LIBRARY_PATH=/usr/local/lib/llama/rocm:/opt/rocm/lib:/usr/lib/x86_64-linux-gnu"
+    cmd: |
+      llama-server-rocm \
+        --model /models/unsloth/Qwen3.6-35B-A3B-Q8_0.gguf \
+        --mmproj /models/unsloth/Qwen3.6-35B-A3B-mmproj-F16.gguf \
+        --n-gpu-layers 99 \
+        --spec-type draft-mtp \
+        --spec-draft-n-max 3 \
+        --spec-draft-ngl 99 \
+        --spec-draft-adaptive \
+        --ctx-size 262144 \
+        --moe-cache-mib 8192 \
+        --batch-size 1024 \
+        --ubatch-size 1024 \
+        --threads 8 \
+        --threads-batch 8 \
+        --parallel 1 \
+        --cache-type-k q8_0 \
+        --cache-type-v q8_0 \
+        --host 0.0.0.0 \
+        --reasoning-preserve \
+        --port ${PORT}
+    ttl: 120
+
+  Muse-Glimmer-30B:
+    env:
+      - "HSA_OVERRIDE_GFX_VERSION=11.5.1"
+      - "HIP_VISIBLE_DEVICES=0"
+      - "ROCBLAS_USE_HIPBLASLT=1"
+      - "GGML_CUDA_ENABLE_UNIFIED_MEMORY=1"
+      - "LD_LIBRARY_PATH=/usr/local/lib/llama/rocm:/opt/rocm/lib:/usr/lib/x86_64-linux-gnu"
+    cmd: |
+      llama-server-rocm \
+        --model /models/unsloth/Muse-Glimmer-30B-UD-Q8_K_XL.gguf  \
+        --mmproj /models/unsloth/Muse-Glimmer-30B-BF16-mmproj.gguf  \
+        --model-draft /models/unsloth/Muse-Glimmer-30B-dflash-kquant.gguf \ 
+        --spec-type draft-dflash \
+        --spec-draft-n-max 15 \
+        --spec-draft-adaptive \
+        --n-gpu-layers 99 \
+        --n-gpu-layers-draft 99 \
+        --ctx-size 131072 \
+        --parallel 1 \
+        --flash-attn on \
+        --jinja \
+        --temp 1.0 \
+        --top-p 0.95 \
+        --top-k 64 \
+        --chat-template-kwargs '{"reasoning_strength":"low"}' \
+        --host 0.0.0.0 \
+        --port ${PORT}
+    ttl: 120  
+
+# -------------------------------------------------------------------------
+# Image Generation Models
+# -------------------------------------------------------------------------
+
+  Qwen-Image-2.1:
+    name: "Qwen Image 2.1 (Gufo)"
+    env:
+      - "HSA_OVERRIDE_GFX_VERSION=11.5.1"
+      - "HIP_VISIBLE_DEVICES=0"
+      - "GGML_HIP_NO_VMM=1"   
+    checkEndpoint: /health
+    ready_path: "/health"
+    ready_timeout: "5m"
+    cmd: |
+      gufo serve image \
+        --host 127.0.0.1 \
+        --port ${PORT} \
+        --model /models/Qwen/Qwen-Image-2.1 \
+        --served-model-name Qwen-Image-2.1 
+    ttl: 60
+    
+  FLUX.1-dev-Q8_0:
+    name: "FLUX.1-dev Q8"
+    env:
+      - "HSA_OVERRIDE_GFX_VERSION=11.5.1"
+      - "HIP_VISIBLE_DEVICES=0"
+      - "HIP_FORCE_QUEUE_TYPE=RESERVED"  # Forces dedicated hardware ring queues on gfx1151
+      - "GGML_HIP_NO_VMM=1"              # Bypasses driver crash vulnerabilities during heavy layer transitions
+      - "LD_LIBRARY_PATH=/usr/local/lib/llama/rocm:/opt/rocm/lib:/usr/lib/x86_64-linux-gnu"
+    checkEndpoint: /
+    ready_path: "/sdapi/v1/sd-models"
+    ready_timeout: "5m"
+    cmd: |
+      /usr/local/bin/sd-server-rocm \
+        --listen-port ${PORT} \
+        --diffusion-fa \
+        --diffusion-model /models/leejet/flux1-dev-Q8_0.gguf \
+        --clip_l /models/city96/clip_l.safetensors \
+        --t5xxl /models/second-state/t5xxl-Q8_0.gguf \
+        --vae /models/city96/ae.safetensors \
+        --vae-conv-direct \
+        --vae-tiling \
+        --threads 16 \
+        --cfg-scale 1.0 \
+        --guidance 3.5 \
+        --steps 20 \
+        --sampling-method euler \
+        --scheduler simple \
+        --type bf16
+    ttl: 60
+
+  FLUX.3-klein-Q8_0:
+    name: "FLUX.3-klein Q8"
+    env:
+      - "HSA_OVERRIDE_GFX_VERSION=11.5.1"
+      - "HIP_VISIBLE_DEVICES=0"
+      - "HIP_FORCE_QUEUE_TYPE=RESERVED"  # Forces dedicated hardware ring queues on gfx1151
+      - "GGML_HIP_NO_VMM=1"              # Bypasses driver crash vulnerabilities during heavy layer transitions
+      - "LD_LIBRARY_PATH=/usr/local/lib/llama/rocm:/opt/rocm/lib:/usr/lib/x86_64-linux-gnu"
+    checkEndpoint: /
+    ready_path: "/sdapi/v1/sd-models"
+    ready_timeout: "5m"
+    cmd: |
+      /usr/local/bin/sd-server-rocm \
+        --listen-port ${PORT} \
+        --diffusion-fa \
+        --diffusion-model /models/leejet/FLUX.3-klein/model.safetensors  \
+        --llm  /models/leejet/FLUX.3-klein/Qwen3VL-4B-Instruct-F16.gguf  \
+        --vae /models/leejet/FLUX.3-klein/ae.safetensors \
+        --vae-conv-direct \
+        --vae-tiling \
+        --threads 16 \
+        --cfg-scale 1.0 \
+        --steps 16 \
+        --sampling-method euler 
+    ttl: 60
+
+
+  # -------------------------------------------------------------------------
+  # NPU Models (FastFlowLM)
+  # Run on Ryzen AI NPU (XDNA2), independent of GPU
+  # NPU models use ~500MB-1GB each
+  # -------------------------------------------------------------------------
+
+  "qwen3.6-moe:35b-a3b":
+    name: "Qwen3.6-35B-A3B-NPU2"
+    cmd: |
+      /opt/fastflowlm/flm serve qwen3.6-moe:35b-a3b \
+      --port ${PORT} \
+      --host 0.0.0.0 \
+      --ctx-len 262144 \
+      --prefill-chunk-len 4096 \
+      --q-len 4 \
+      --socket 4 \
+      --pmode performance
+    checkEndpoint: /api/tags
+    ready_timeout: 300s
+    capabilities:
+      tools: true
+      in: [text]
+      out: [text]
+    ttl: 300
+  
+  "qwen3.5:9b":
+    name: "Qwen3.5 9B NPU"
+    cmd: |
+      /opt/fastflowlm/flm serve qwen3.5:9b \
+      --port ${PORT} \
+      --host 0.0.0.0 \
+      --ctx-len 262144 \
+      --prefill-chunk-len 4096 \
+      --q-len 4 \
+      --socket 4 \
+      --pmode performance
+    checkEndpoint: /api/tags
+    ready_timeout: 300s
+    capabilities:
+      tools: true
+      in: [text]
+      out: [text]
+    ttl: 300
+
+  "gemma4-it:e4b":
+    name: "Gemma4 E4B-IT NPU"
+    cmd: |
+      /opt/fastflowlm/flm serve gemma4-it:e4b \
+      --port ${PORT} \
+      --host 0.0.0.0 \
+      --ctx-len 131072 \
+      --prefill-chunk-len 4096 \
+      --q-len 4 \
+      --socket 4 \
+      --pmode performance
+    checkEndpoint: /api/tags
+    ready_timeout: 300s
+    capabilities:
+      tools: true
+      in: [text]
+      out: [text]
+    ttl: 300
+
+  "gemma4-it:12b":
+    name: "Gemma4-12B-IT-NPU2"
+    cmd: |
+      /opt/fastflowlm/flm serve gemma4-it:12b \
+      --port ${PORT} \
+      --host 0.0.0.0 \
+      --ctx-len 131072 \
+      --prefill-chunk-len 4096 \
+      --q-len 4 \
+      --socket 4 \
+      --pmode performance
+    checkEndpoint: /api/tags
+    ready_timeout: 300s
+    capabilities:
+      tools: true
+      in: [text]
+      out: [text]
+    ttl: 300
+
+  "whisper-v3:turbo":
+    name: "Whisper-v3:turbo NPU"
+    cmd: |
+      /opt/fastflowlm/flm serve whisper-v3:turbo \
+      --port ${PORT} \
+      --host 0.0.0.0 \
+      --asr true \      
+      --q-len 4 \
+      --socket 4 \
+      --pmode performance
+    checkEndpoint: /v1/audio/transcriptions/
+    ready_timeout: 300s
+    unlisted: true
+    ttl: 60
+
+# =========================================================================
+# Validated Matrix Routing Configuration
+# =========================================================================
+matrix:
+  # vars: One unique short name per specific model ID (alphanumeric, 1-8 chars)
+  vars:
+    # RAG & Utility Models (Small footprint)
+    emb: "Qwen3-Embedding-8B-Q8_0"
+    rer: "Qwen3-Reranker-8B.Q8_0"
+    npuq: "qwen3.5:9b"
+    q36n: "qwen3.6-moe:35b-a3b"
+    npug: "gemma4-it:e4b"
+    wsp: "whisper-v3:turbo"
+
+    # Primary LLMs (Large footprint + Massive Context)
+    gem431: "gemma-4-31B"
+    mero: "MeroMero"
+    gem426: "gemma-4-26B-A4B"
+    q27: "Qwen3.8-27B"
+    q36: "Qwen3.6-35B-A3B"
+
+    # Image Generation Models (Large footprint)
+    qimg: "Qwen-Image-2.1"
+    flux: "FLUX.1-dev-Q8_0"
+
+  # evict_costs: Relative cost of losing a running model
+  evict_costs:
+    emb: 20   # Keep embeddings loaded for immediate RAG readiness
+    rer: 20   # Keep rerankers loaded
+    npuq: 10  # Low cost; NPU models reload very quickly
+    npug: 10
+    wsp: 10
+    gem431: 50   # High cost; Large LLM with huge context is slow to reload
+    gem426: 50
+    mero: 50
+    q27: 50
+    q36: 50
+    q36n: 50
+    qimg: 30  # Medium-high cost; Image models are heavy
+    flux: 30
+
+  # sets: Defines valid concurrent combinations using proper DSL operators
+  sets:
+    # Base building-block expressions
+    gpu: "emb | rer | gem431 | gem426 | mero | q27 | q36 | qimg | flux"
+    npu: "npuq | npug | wsp"
+
+    # Compound pipelines using the mandatory '+' inline reference operator
+    rag_chat: "(emb & rer) & (gem431 | gem426 | mero | q27 | q36)"
+    rag_npu:  "(emb & rer) & +npu"
+    npu_gpu: "+npu & +gpu"

@@ -1,0 +1,269 @@
+services:
+  open-webui:
+    build:
+      context: .
+      dockerfile: Dockerfile.openwebui
+    container_name: open-webui
+    restart: unless-stopped
+    ports:
+      - "3000:8080"
+    environment:
+      - ENABLE_OPENAI_API=True
+      - OPENAI_API_KEY=none
+      - OPENAI_API_BASE_URL=http://llama-swap:8080/v1
+
+      # RAG Embedding
+      - RAG_EMBEDDING_ENGINE=openai
+      - RAG_OPENAI_API_BASE_URL=http://llama-swap:8080/v1
+      - RAG_EMBEDDING_MODEL=Qwen3-Embedding-8B-Q8_0
+      - RAG_EMBEDDING_OPENAI_API_KEY=none
+      - RAG_EMBEDDING_BATCH_SIZE=128
+
+      # RAG Reranking
+      - ENABLE_RAG_RERANKING=True
+      - RAG_RERANKING_MODEL_URL=http://llama-swap:8080/v1/rerank
+      - RAG_RERANKING_MODEL=Qwen3-Reranker-8B-Q8_0
+
+      # Optional: Performance & Reliability
+      - RAG_RERANKING_MODEL_TIMEOUT=60
+      - RAG_SYSTEM_CONTEXT=True
+      - ENABLE_RAG_WEB_CANVAS_ASYNC=False
+
+      # Enable web search
+      - ENABLE_RAG_WEB_SEARCH=True
+      - RAG_WEB_SEARCH_ENGINE=searxng
+      - SEARXNG_QUERY_URL=http://host.docker.internal:8080/search?q=<search>&format=json
+      - SEARXNG_LANGUAGE=en-US
+      - RAG_WEB_SEARCH_RESULT_COUNT=3
+      - RAG_WEB_SEARCH_CONCURRENT_REQUESTS=10
+
+      - RAG_WEB_LOADER=webdriver
+      - WEBDRIVER_URL=http://headless-chrome:3000
+
+        
+      - DEFAULT_USER_ROLE=admin
+      - WEBUI_TIMEOUT=900
+      - GUNICORN_TIMEOUT=1000
+
+      - CONTENT_EXTRACTION_ENGINE=docling
+      - DOCLING_SERVER_URL=http://docling:5001
+
+
+      # Use Qdrant vector database
+      - VECTOR_DB=qdrant
+      - QDRANT_URI=http://qdrant:6333
+      - QDRANT_GRPC_URI=qdrant:6334 
+
+      - TZ=America/Los_Angeles
+
+      # Suppress  SyntaxWarning: invalid escape sequence 
+      - PYTHONWARNINGS=ignore 
+    volumes:
+      - ./data:/app/backend/data
+    networks:
+      - app-net
+    depends_on:
+      - qdrant
+      - llama-swap
+      - docling
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  hermes:
+    build:
+      context: .
+      dockerfile: Dockerfile.hermes
+    stdin_open: true # docker run -i
+    tty: true        # docker run -t
+    container_name: hermes
+    restart: unless-stopped
+    command: gateway run
+    ports:
+      - "8642:8642"   # gateway API
+      - "9119:9119"   # dashboard (only reached when HERMES_DASHBOARD=1)
+      - "9120:9120"   # Hermes webapp
+      - "9377:9377"
+    volumes:
+      - ./hermes-data:/opt/data
+      - /mnt/Data/Dockerfiles/comfyui/shared:/shared
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /usr/bin/docker:/usr/bin/docker:ro
+    shm_size: '2gb' 
+    environment:
+      - HERMES_DASHBOARD=1
+      - HERMES_UID=1000
+      - HERMES_GID=1000
+      - HOME=/opt/data
+      - HERMES_HOME=/opt/data
+      - HERMES_AUXILIARY_PROVIDER=custom
+      - API_SERVER_ENABLED=true
+      - API_SERVER_HOST=0.0.0.0
+      - API_SERVER_PORT=8642
+      - API_SERVER_KEY=${API_SERVER_KEY:-}
+      - BROWSER_PROVIDER=camofox
+      - CAMOFOX_URL=http://127.0.0.1:9377
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+      # Or if your agent framework takes a full URL:
+      - QDRANT_URL=http://qdrant:6333
+      # Use a unique collection name specifically for memory
+      - QDRANT_MEMORY_COLLECTION=hermes_memory 
+      - COMFYUI_URL=http://comfyui-strix-halo:8188
+       # --- ROCm / HIP Configuration ---
+      - HIP_VISIBLE_DEVICES=0
+      - ROCR_VISIBLE_DEVICES=0
+
+      # --- Vulkan Configuration ---
+      - VULKAN_VISIBLE_DEVICES=0
+      # Uncomment to forward specific env vars instead of using .env file:
+      # - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      # - OPENAI_API_KEY=${OPENAI_API_KEY}
+      # - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}    
+    networks:
+      - app-net
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          cpus: "2.0"
+
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    environment:
+      - QDRANT__STORAGE__ASYNC_IO=true
+      - QDRANT__STORAGE__PERFORMANCE__MAX_INDEXING_THREADS=16
+      - TZ=America/Los_Angeles
+    volumes:
+      - ./qdrant_data:/qdrant/storage
+    networks:
+      - app-net
+    restart: unless-stopped
+    # THIS is the correct way to limit RAM:
+    deploy:
+      resources:
+        limits:
+          memory: 24G  # Hard cap at 24GB
+    # Optional: Prevent swap usage
+    memswap_limit: 24G
+
+  llama-swap:
+    build:
+      context: .
+      dockerfile: Dockerfile.llama-swap
+    container_name: llama-swap
+    ports:
+      - "9292:8080"
+    devices:
+      - "/dev/kfd:/dev/kfd"
+      - "/dev/dri:/dev/dri"
+      - "/dev/accel/accel0:/dev/accel/accel0"
+    mem_swappiness: 0
+    security_opt:
+      - seccomp:unconfined
+    ipc: host
+    
+    # --- ADD THESE SECTIONS ---
+    cap_add:
+      - IPC_LOCK              # Required to allow memory locking
+    ulimits:
+      memlock:
+        soft: -1              # Set soft limit to unlimited
+        hard: -1              # Set hard limit to unlimited
+    # --------------------------
+
+    volumes:
+      - ./llama-swap-config.yaml:/app/config.yaml
+      - ./models/:/models
+      - ./flm-data:/root/.config/flm
+      - /lib/firmware:/lib/firmware:ro
+      - /opt/llama-cache:/cache
+
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /usr/bin/docker:/usr/bin/docker:ro
+
+      - /mnt/Data/Dockerfiles/comfyui/storage/models:/workspace/ComfyUI/models
+      - /mnt/Data/Dockerfiles/comfyui/storage/output:/workspace/ComfyUI/output
+      - /mnt/Data/Dockerfiles/comfyui/storage/input:/workspace/ComfyUI/input
+      - /mnt/Data/Dockerfiles/comfyui/storage/custom_nodes:/workspace/ComfyUI/custom_nodes
+    networks:
+      - app-net    
+    restart: unless-stopped
+    environment:
+      - "ROCBLAS_USE_HIPBLASLT=1"
+      - "HSA_OVERRIDE_GFX_VERSION=11.5.1"
+      - ROCm_ENABLE_FINEGRAINED=1
+      - "HIP_VISIBLE_DEVICES=0"
+      - "ROC_ENABLE_PRE_VEGA=0"
+      - "LD_LIBRARY_PATH=/usr/local/lib/llama/rocm:/opt/rocm/lib:/usr/lib/x86_64-linux-gnu"
+      - HOST=127.0.0.1
+      - TZ=America/Los_Angeles
+      - GUFO_ALLOC_VRAM_GB=96      # Tells Gufo to claim the 96GB iGPU allocation
+      - GUFO_AUTO_CACHE=true       # Enables the hybrid MoE graph-cache natively
+    group_add:
+      - "44"   # Host GID for video
+      - "992"  # Host GID for render
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  docling:
+    image: quay.io/docling-project/docling-serve:latest
+    container_name: docling
+    restart: unless-stopped
+    ports:
+      - "5001:5001"
+    environment:
+      - DOCLING_SERVE_ENABLE_UI=true # Optional - Lets you visit http://localhost:5001 in your browser to test it
+      - VICORN_WORKERS=1 
+      - OMP_NUM_THREADS=8 
+      - DOCLING_NUM_THREADS=8        # Optimizes performance for your Strix Halo CPU cores
+      - TZ=America/Los_Angeles
+    volumes:
+      - docling-cache:/sys/fs/cgroup  # Optional: Speeds up model reload times
+  
+    networks:
+      - app-net
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  camofox:
+    image: ghcr.io/redf0x1/camofox-browser:latest
+    container_name: camofox
+    restart: unless-stopped
+    # Forces the container to run using your exact user ID boundaries
+    user: "1000:1000" 
+    network_mode: "service:hermes"
+    volumes:
+      - ./camofox-data:/home/node/.camofox
+    shm_size: '2gb'
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  docling-cache:   
+  
+networks:
+  app-net:
+    driver: bridge

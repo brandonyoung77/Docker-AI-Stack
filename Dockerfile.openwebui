@@ -1,0 +1,46 @@
+FROM ubuntu:24.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+# 1. Install ONLY the runtime dependencies required by Python and Open WebUI
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libssl3t64 \
+    libsqlite3-0 \
+    zlib1g \
+    libbz2-1.0 \
+    liblzma5 \
+    libffi8 \
+    libncursesw6 \
+    libtirpc3 \
+    curl \
+    tzdata \
+    && rm -rf /var/lib/apt/lists/*
+
+# 2. Install your custom optimized Python package 
+WORKDIR /tmp
+COPY binaries/python-3.12.16-strix.deb .
+RUN apt-get update && \
+    apt-get install -y /tmp/python-3.12.16-strix.deb && \
+    rm -rf /var/lib/apt/lists/* /tmp/python-3.12.16-strix.deb
+
+# 3. Setup Virtual Environment and Install Open WebUI
+WORKDIR /app
+RUN /usr/local/bin/python3.12 -m venv open-webui-env
+ENV PATH="/app/open-webui-env/bin:$PATH"
+
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel
+RUN pip install --no-cache-dir open-webui beautifulsoup4 qdrant_client
+
+# 4. Environment and Security
+ENV DATA_DIR=/app/backend/data \
+    WEBUI_NAME="Open WebUI (Zen 5 / Strix Halo Optimized)" \
+    WEBUI_SECRET_KEY="replace_with_a_secure_persistent_secret_key" \
+    PORT=8080
+
+RUN chown -R ubuntu:ubuntu /app
+USER ubuntu
+
+EXPOSE 8080
+CMD ["open-webui", "serve"]
+

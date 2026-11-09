@@ -1,0 +1,226 @@
+# =============================================================================
+# Dockerfile.hermes
+#
+# A thin layer ON TOP of the official Hermes Agent image that:
+#   1. bakes in extra system / Python / Node programs that SURVIVE image
+#      refreshes and `docker compose up` recreates, and
+#   2. rebuilds Hermes's own venv (/opt/hermes/.venv) on a CUSTOM Python
+#      (Strix Halo build) so the agent itself runs on your interpreter.
+#      The exact point release is set by the PYTHON_DEB / PYTHON_VERSION
+#      build args (section 3).
+#
+# WHY THIS PERSISTS
+#   * The official image seals /opt/hermes read-only for the *runtime* user and
+#     keeps all writable state under the /opt/data volume. Anything you `apt` /
+#     `pip` / `npm` install at *build time* lands in the image filesystem
+#     (not the volume), so it survives:
+#       - container recreates  (docker compose up -d --force-recreate)
+#       - image refreshes      (re-run this build, or bump the FROM tag)
+#   * Your /opt/data volume (config, sessions, memory, skills, auth) is left
+#     completely untouched, so all of that keeps working.
+#
+# WHY RUNNING HERMES ON YOUR CUSTOM PYTHON IS SAFE
+#   * hermes-agent declares requires-python = ">=3.11,<3.14". Keep
+#     PYTHON_VERSION inside that range. 3.14 is NOT in range (Rust-backed
+#     transitives like pydantic-core have no cp314 wheels) — do NOT point
+#     this at a 3.14 build.
+#   * Verified against your .deb: venv creation, and installation + import of
+#     pydantic-core (the package the <3.14 cap exists for) both succeed on it.
+#   * The image's boot scripts reference the venv BY PATH only
+#     (/opt/hermes/.venv/bin/python, .venv/bin/activate, .venv/bin/hermes),
+#     never by version, so rebuilding the venv in place is transparent to
+#     everything downstream.
+#   * The system /usr/bin/python3.13 is statically linked — your .deb's
+#     /usr/local/lib/libpython3.13.so cannot collide with it.
+#   * Runtime lazy-installed plugin packages under /opt/data/lazy-packages are
+#     keyed by major.minor + ABI (3.13 / cpython-313), so they stay valid.
+#
+# BUILD (on the host with the Docker daemon — NOT from inside the container).
+# The compose build context (your project directory) must contain the .deb at
+# the PYTHON_DEB path (default: binaries/). Plain `docker build` works too —
+# run it from the project directory:
+#
+#   cd <your compose project directory>     # where the Dockerfile + binaries/ live
+#   docker build -f Dockerfile.hermes \
+#     -t hermes-agent:custom \
+#     --build-arg PYTHON_DEB=binaries/python-3.13.16-strix.deb \
+#     --build-arg PYTHON_VERSION=3.13.16 \
+#     --build-arg APT_PACKAGES="jq htop tmux" \
+#     --build-arg PIP_PACKAGES="httpx rich" \
+#     --build-arg NPM_PACKAGES="yq" \
+#     .
+#
+# (Or edit the ARG defaults below and omit the --build-arg flags. For a newer
+# 3.13.x point release, change ONLY PYTHON_DEB + PYTHON_VERSION — section 3.)
+#
+# THEN, in your docker compose file, change only the image line:
+#
+#     services:
+#       hermes:
+#         image: hermes-agent:custom   # was: nousresearch/hermes-agent:latest
+#         # ...every existing volume / env / port / mount stays identical
+#
+# Upstream update: re-run the same build (re-pulls :latest, re-applies your
+# layers on top). To pin a release instead, change the tag on the FROM line.
+# =============================================================================
+
+FROM nousresearch/hermes-agent:latest
+
+# -----------------------------------------------------------------------------
+# All blocks below are OPTIONAL no-ops when their list is empty ("").
+# -----------------------------------------------------------------------------
+
+# --- 1) SYSTEM packages (Debian 13 / trixie) ---------------------------------
+# Space-separated `apt` package names. Examples: jq htop tmux ripgrep vim \
+# curl wget unzip tree ncdu ffmpeg sqlite3
+ARG APT_PACKAGES="jq sqlite3 libsqlite3-0 libssl-dev build-essential gcc-14 g++-14 vim"
+RUN if [ -n "$APT_PACKAGES" ]; then \
+      apt-get update \
+      && apt-get install -y --no-install-recommends $APT_PACKAGES \
+      && rm -rf /var/lib/apt/lists/*; \
+    fi
+
+# Enable non-free + contrib
+RUN sed -i 's/Components: main/Components: main contrib non-free non-free-firmware/' /etc/apt/sources.list.d/debian.sources || \
+    echo "deb http://deb.debian.org/debian trixie main contrib non-free non-free-firmware" > /etc/apt/sources.list
+
+
+COPY binaries/ffmpeg-optimized.deb /tmp/
+RUN apt-get update && \
+    apt-get install -y /tmp/ffmpeg-optimized.deb && \
+    rm -rf /var/lib/apt/lists/* /tmp/ffmpeg-optimized.deb
+
+# --- 2) Node / npm GLOBAL packages --------------------------------------------
+# Space-separated npm package names, installed globally so their CLI binaries
+# land on PATH. Examples: yq prettier typescript
+ARG NPM_PACKAGES=""
+RUN if [ -n "$NPM_PACKAGES" ]; then \
+      npm install -g $NPM_PACKAGES; \
+    fi
+
+# --- 3) CUSTOM Python (Strix Halo build) + HERMES VENV REBUILD ----------------
+# THE TWO VALUES TO EDIT for a newer 3.13.x point release (defaults below, or
+# pass via --build-arg):
+#   PYTHON_DEB      — path to the .deb, RELATIVE TO THE COMPOSE BUILD CONTEXT
+#                     (your project directory — where you run `docker compose
+#                     build`), NOT the Dockerfile's location. A leading / is
+#                     also context-root-relative, never filesystem-absolute.
+#   PYTHON_VERSION  — the exact full version it provides, e.g. 3.13.17
+# The interpreter path, the venv rebuild, and the build-time assertions all
+# derive from these, so nothing else needs to change. The .deb installs under
+# /usr/local with versioned names (python3.13, libpython3.13.so.1.0) — no
+# file collisions with the image's Debian python3.13; `apt-get install
+# <path-to-.deb>` auto-resolves the missing runtime deps (libtirpc3t64,
+# libnsl2) from the repos.
+ARG PYTHON_DEB=binaries/python-3.14.10-strix.deb
+ARG PYTHON_VERSION=3.14.10
+COPY ${PYTHON_DEB} /tmp/custom-python.deb
+# The final check catches a PYTHON_DEB / PYTHON_VERSION mismatch at install
+# time — fail fast, before the expensive venv rebuild.
+RUN set -eux; \
+    PYMM=$(printf '%s' "$PYTHON_VERSION" | cut -d. -f1,2); \
+    PYBIN=/usr/local/bin/python${PYMM}; \
+    apt-get update \
+    && apt-get install -y --no-install-recommends /tmp/custom-python.deb \
+    && rm -f /tmp/custom-python.deb \
+    && rm -rf /var/lib/apt/lists/* \
+    && ACTUAL=$("$PYBIN" -V 2>&1) \
+    && [ "$ACTUAL" = "Python $PYTHON_VERSION" ] \
+       || { echo "FATAL: deb installed '$ACTUAL', expected 'Python $PYTHON_VERSION' — fix PYTHON_DEB or PYTHON_VERSION"; exit 1; } \
+    && echo "custom interpreter: $PYBIN ($ACTUAL)"
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+# Extra PyPI packages to install into the NEW venv (space-separated).
+# Examples: httpx rich pandas pyyaml   (pins are fine: "httpx==0.27.0 rich")
+ARG PIP_PACKAGES="qdrant-client mem0ai[nlp] httpx comfy-mcp comfy-cli>=1.14.0"
+
+# Rebuild Hermes's venv on the custom interpreter. This mirrors the official
+# image's own build steps (uv sync --frozen with the production extra set,
+# then the editable link of hermes-agent itself), pointed at the interpreter
+# derived from PYTHON_VERSION via UV_PYTHON. Every consumer references the
+# venv by path, so nothing else in the image needs to change.
+# The trailing lines are hard failures: any mismatch fails the build loudly,
+# at build time, instead of on the first boot.
+RUN set -eux; \
+    PYMM=$(printf '%s' "$PYTHON_VERSION" | cut -d. -f1,2); \
+    PYBIN=/usr/local/bin/python${PYMM}; \
+    [ -x "$PYBIN" ] || { echo "FATAL: $PYBIN not found — was PYTHON_VERSION set correctly?"; exit 1; }; \
+    rm -rf /opt/hermes/.venv; \
+    cd /opt/hermes; \
+    UV_PYTHON=$PYBIN uv venv .venv --prompt hermes-agent; \
+    UV_PYTHON=$PYBIN uv sync --frozen --no-install-project \
+      --extra all --extra messaging --extra otlp \
+      --extra anthropic --extra bedrock --extra azure-identity \
+      --extra matrix --extra google-chat; \
+    uv pip install --no-cache-dir --no-deps -e .; \
+    if [ -n "$PIP_PACKAGES" ]; then \
+      uv pip install --python /opt/hermes/.venv/bin/python $PIP_PACKAGES; \
+    fi; \
+    ACTUAL=$(/opt/hermes/.venv/bin/python -V 2>&1); \
+    [ "$ACTUAL" = "Python $PYTHON_VERSION" ] \
+      || { echo "FATAL: venv runs '$ACTUAL', expected 'Python $PYTHON_VERSION'"; exit 1; }; \
+    /opt/hermes/.venv/bin/python -c "import hermes_cli, agent, acp_adapter, pydantic_core, sqlite3; print('core imports OK')"; \
+    /opt/hermes/.venv/bin/hermes --version
+
+# --- 4) Anything else (optional) ---------------------------------------------
+# Free-form block for one-off setup that doesn't fit the blocks above:
+# create a user, write a config file, set up a symlink, post-install steps.
+# No-op as-is.
+#
+# RUN echo "# custom setup" && \
+#     ln -s /opt/hermes/.venv/bin/some-tool /usr/local/bin/mytool
+
+
+# Install Rust via rustup into a location accessible to the Hermes service user
+ENV CARGO_HOME=/opt/rust
+ENV RUSTUP_HOME=/opt/rust/rustup
+ENV PATH="/opt/rust/bin:/usr/local/go/bin:/opt/go/bin:${PATH}"
+
+RUN mkdir -p /opt/rust \
+    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+       | sh -s -- -y --default-toolchain stable \
+    && /opt/rust/bin/rustup update stable \
+    && /opt/rust/bin/rustup component add rustfmt clippy \
+    && chown -R 1000:1000 /opt/rust
+
+
+# Install Go from the pre-downloaded archive
+COPY binaries/go1.27.3.linux-amd64.tar.gz /tmp/go.tar.gz
+
+RUN tar -C /usr/local -xzf /tmp/go.tar.gz \
+    && rm /tmp/go.tar.gz
+
+ENV GOROOT=/usr/local/go
+ENV GOPATH=/opt/go
+ENV PATH="/usr/local/go/bin:/opt/go/bin:${PATH}"
+
+# Preserve Go and Rust paths in login shells
+RUN sed -i 's|^  PATH="/usr/local/bin:/usr/bin:/bin:/usr/local/games:/usr/games"$|  PATH="/usr/local/go/bin:/opt/go/bin:/opt/rust/bin:/opt/data/.cargo/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/games:/usr/games"|' /etc/profile
+
+
+# FIXED: Temporary blank RUSTFLAGS to stop procedural build macro Bitcode compilation errors
+RUN RUSTFLAGS="-C target-cpu=znver5" cargo install cargo-c --locked
+
+ENV RUSTFLAGS="-C opt-level=3 -C target-cpu=znver5 -C relocation-model=pic  -C lto=fat -C codegen-units=1"
+
+RUN set -eu; \
+    curl -fsSL https://opencode.ai/v2/install | bash; \
+    opencode_bin="$(find /root -name opencode -type f -executable -print -quit)"; \
+    if [ -z "$opencode_bin" ]; then \
+        echo "ERROR: OpenCode executable not found under /root"; \
+        exit 1; \
+    fi; \
+    install -m 0755 "$opencode_bin" /usr/local/bin/opencode; \
+    /usr/local/bin/opencode --version
+
+# Ensure binaries are explicitly on the universal PATH
+ENV PATH="/root/.local/bin:/root/.hermes/bin:${PATH}"
+
+# -----------------------------------------------------------------------------
+# NOTE: we deliberately do NOT override USER, ENTRYPOINT, CMD, VOLUME, or any
+# ENV. The official image ends as USER root with its own s6-overlay entrypoint
+# that drops to the `hermes` user at boot; keeping all of that intact means
+# this derived image behaves identically to the stock one, but runs Hermes on
+# your 3.13.16 interpreter and carries your extra programs.
+# -----------------------------------------------------------------------------

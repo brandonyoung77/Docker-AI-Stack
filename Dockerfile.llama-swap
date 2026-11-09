@@ -1,0 +1,407 @@
+# syntax=docker/dockerfile:1.4
+
+# =========================================================================
+# STAGE 0: ROCm Tarball Helper
+# =========================================================================
+FROM debian:trixie AS rocm-tarball
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    wget ca-certificates xz-utils && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /tmp/rocm
+COPY ./binaries/therock-dist-linux-gfx1151-10.1.0.tar.gz /tmp/rocm.tar.gz
+
+RUN mkdir -p /opt/rocm-10.1.0 && \
+    tar -xf /tmp/*.tar.gz -C /opt/rocm-10.1.0/ && \
+    rm /tmp/rocm.tar.gz
+
+RUN ln -sf /opt/rocm-10.1.0 /opt/rocm
+RUN ldconfig -v
+
+# =========================================================================
+# STAGE 1: Build Stage (llama.cpp + Stable Diffusion) ROCm
+# =========================================================================
+FROM debian:trixie AS build-rocm
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+COPY --from=rocm-tarball /opt/rocm-10.1.0 /opt/rocm-10.1.0
+RUN ln -sf /opt/rocm-10.1.0 /opt/rocm
+
+# Apt pinning for GCC 16 from Sid
+RUN echo "deb http://deb.debian.org/debian sid main contrib non-free non-free-firmware" > /etc/apt/sources.list.d/sid.list \
+    && printf "Package: *\nPin: release a=unstable\nPin-Priority: 100\n" > /etc/apt/preferences.d/sid \
+    && printf "Package: gcc-16 g++-16 libstdc++-16-dev\nPin: release a=unstable\nPin-Priority: 990\n" >> /etc/apt/preferences.d/sid
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
+        gcc-16 g++-16 libstdc++-16-dev \
+        cmake ninja-build make git ca-certificates \
+        wget gnupg2 \
+        python3 python3-venv python3-pip \
+        libnuma-dev libtinfo-dev libxml2-dev \
+        libssl-dev pkg-config \
+        libatomic1 libquadmath0 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-16 100 \
+    --slave /usr/bin/g++ g++ /usr/bin/g++-16 \
+    --slave /usr/bin/gcov gcov /usr/bin/gcov-16
+
+ENV PATH="/opt/rocm/bin:${PATH}"
+ENV ROCM_PATH=/opt/rocm
+ENV HIP_PATH=/opt/rocm
+ENV LD_LIBRARY_PATH="/opt/rocm/lib:/opt/rocm/llvm/lib:${LD_LIBRARY_PATH}"
+ENV CC=/opt/rocm/llvm/bin/clang
+ENV CXX=/opt/rocm/llvm/bin/clang++
+ENV LDFLAGS="-flto=auto -Wl,-O1"
+
+# -------------------------------------------------------------------------
+# Compiling llama.cpp
+# -------------------------------------------------------------------------
+COPY ./strix-llama.cpp /tmp/llama.cpp
+WORKDIR /tmp/llama.cpp
+
+RUN --mount=type=cache,target=/tmp/compile_lock,sharing=locked \
+    --mount=type=cache,target=/root/.cache/ccache,sharing=shared \
+    cmake -B build-rocm -G "Ninja" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_C_COMPILER=/usr/bin/gcc-16 \
+    -DCMAKE_CXX_COMPILER=/usr/bin/g++-16 \
+    -DCMAKE_HIP_COMPILER=/opt/rocm/llvm/bin/clang++ \
+    -DGGML_HIP=ON \
+    -DGPU_TARGETS="gfx1151" \
+    -DGGML_HIP_GRAPHS=OFF \
+    -DGGML_HIP_NO_VMM=ON \
+    -DGGML_HIP_ROCWMMA=ON \
+    -DGGML_HIP_ROCWMMA_FATTN=ON \
+    -DGGML_HIP_SAMPLER=ON \
+    -DBUILD_SHARED_LIBS=OFF \
+    -DLLAMA_BUILD_TESTS=OFF \
+    -DLLAMA_BUILD_EXAMPLES=OFF \
+    -DLLAMA_BUILD_SERVER=ON \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+    -DCMAKE_C_FLAGS="-O3 -march=znver5 -mtune=znver5 -mprefer-vector-width=512 -fPIC -pipe" \
+    -DCMAKE_CXX_FLAGS="-O3 -march=znver5 -mtune=znver5 -mprefer-vector-width=512 -fPIC -pipe" \
+    && cmake --build build-rocm -j$(nproc) \
+    && cmake --install build-rocm --prefix /app/install-rocm
+
+# -------------------------------------------------------------------------
+# Compiling stable-diffusion.cpp
+# -------------------------------------------------------------------------
+COPY ./stable-diffusion.cpp /tmp/stable-diffusion.cpp
+WORKDIR /tmp/stable-diffusion.cpp
+
+RUN --mount=type=cache,target=/tmp/compile_lock,sharing=locked \
+    --mount=type=cache,target=/root/.cache/ccache,sharing=shared \
+    cmake -B build-rocm -G "Ninja" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_C_COMPILER=/usr/bin/gcc-16 \
+    -DCMAKE_CXX_COMPILER=/usr/bin/g++-16 \
+    -DCMAKE_HIP_COMPILER=/opt/rocm/llvm/bin/clang++ \
+    -DSD_HIPBLAS=ON \
+    -DSD_HIP=ON \
+    -DGPU_TARGETS="gfx1151" \
+    -DCMAKE_HIP_ARCHITECTURES="gfx1151" \
+    -DGGML_FLASH_ATTN=ON \
+    -DGGML_HIP_GRAPHS=OFF \
+    -DGGML_HIP_NO_VMM=ON \
+    -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+    -DCMAKE_C_FLAGS="-O3 -march=znver5 -mtune=znver5 -mprefer-vector-width=512 -fPIC -pipe" \
+    -DCMAKE_CXX_FLAGS="-O3 -march=znver5 -mtune=znver5 -mprefer-vector-width=512 -fPIC -pipe" \
+    -DCMAKE_HIP_FLAGS="-O3 -pipe -mllvm --amdgpu-unroll-threshold-local=600" \
+    && cmake --build build-rocm -j$(nproc) \
+    && cmake --install build-rocm --prefix /app/install-sd-rocm
+
+# =========================================================================
+# STAGE 1b: Build Gufo (Pure ROCm Clang / hipcc Unified Toolchain)
+# =========================================================================
+FROM debian:trixie AS build-gufo
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+COPY --from=rocm-tarball /opt/rocm-10.1.0 /opt/rocm-10.1.0
+RUN ln -sf /opt/rocm-10.1.0 /opt/rocm
+
+# Enable non-free + contrib
+RUN sed -i 's/Components: main/Components: main contrib non-free non-free-firmware/' /etc/apt/sources.list.d/debian.sources || \
+    echo "deb http://deb.debian.org/debian trixie main contrib non-free non-free-firmware" > /etc/apt/sources.list
+
+# Apt pinning for GCC 16 from Sid
+RUN echo "deb http://deb.debian.org/debian sid main contrib non-free non-free-firmware" > /etc/apt/sources.list.d/sid.list \
+    && printf "Package: *\nPin: release a=unstable\nPin-Priority: 100\n" > /etc/apt/preferences.d/sid \
+    && printf "Package: gcc-16 g++-16 libstdc++-16-dev\nPin: release a=unstable\nPin-Priority: 990\n" >> /etc/apt/preferences.d/sid
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
+        gcc-16 g++-16 libstdc++-16-dev \
+        cmake ninja-build make git ca-certificates \
+        build-essential curl ccache \
+        libicu-dev libcurl4-openssl-dev libssl-dev \
+        libpng-dev libjpeg-dev libwebp-dev \
+        libsndfile1-dev libsoxr-dev \
+        libnuma-dev libtinfo-dev libxml2-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-16 100 \
+    --slave /usr/bin/g++ g++ /usr/bin/g++-16 \
+    --slave /usr/bin/gcov gcov /usr/bin/gcov-16
+
+# Optimized Python + FFmpeg
+COPY binaries/python-3.12.16-strix.deb /tmp/
+COPY binaries/ffmpeg-optimized.deb /tmp/
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
+        /tmp/python-3.12.16-strix.deb /tmp/ffmpeg-optimized.deb \
+    && TARGET_PY=$(which python3.12 || which /usr/local/bin/python3.12 || which /usr/bin/python3.12) \
+    && ln -sf "$TARGET_PY" /usr/bin/python3 \
+    && ln -sf "$TARGET_PY" /usr/local/bin/python3 \
+    && ln -sf "$TARGET_PY" /usr/bin/python \
+    && rm -rf /var/lib/apt/lists/* /tmp/python-3.12.16-strix.deb /tmp/ffmpeg-optimized.deb
+
+# Rust
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
+    && . "$HOME/.cargo/env" \
+    && rustup default stable \
+    && rustup update stable \
+    && rustup component add rustfmt clippy
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    . "$HOME/.cargo/env" \
+    && cargo install cargo-c --locked
+
+# IMPORTANT: do NOT put -C lto=fat here.
+# Cargo injects -C embed-bitcode=no on dependencies/build-scripts;
+# the two flags are incompatible and break the PNG decoder (and others).
+ENV PATH="/root/.cargo/bin:${PATH}"
+ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C opt-level=3 -C target-cpu=znver5 -C relocation-model=pic -C codegen-units=1"
+
+ENV PATH="/usr/lib/ccache:/opt/rocm/bin:/opt/rocm/llvm/bin:${PATH}"
+ENV ROCM_PATH=/opt/rocm
+ENV HIP_PATH=/opt/rocm
+ENV LD_LIBRARY_PATH="/opt/rocm/lib:/opt/rocm/llvm/lib:${LD_LIBRARY_PATH}"
+ENV CMAKE_PREFIX_PATH="/opt/rocm"
+
+ENV CC=/opt/rocm/llvm/bin/clang
+ENV CXX=/opt/rocm/bin/hipcc
+ENV HIPCC_COMPILER=/opt/rocm/llvm/bin/clang++
+
+WORKDIR /tmp
+COPY ./gufo /tmp/gufo
+WORKDIR /tmp/gufo
+
+RUN --mount=type=cache,target=/tmp/compile_lock,sharing=locked \
+    --mount=type=cache,target=/root/.cache/ccache,sharing=shared \
+    cmake --preset release \
+      -DCMAKE_INSTALL_PREFIX=/app/install-gufo \
+      -DCMAKE_PREFIX_PATH="/opt/rocm" \
+      -DGPU_TARGETS="gfx1151" \
+      -DAMDGPU_TARGETS="gfx1151" \
+      -DCMAKE_HIP_ARCHITECTURES="gfx1151" \
+      -DOFFLOAD_ARCH_STRINGS="gfx1151" \
+      -DCMAKE_C_COMPILER=/opt/rocm/llvm/bin/clang \
+      -DCMAKE_CXX_COMPILER=/opt/rocm/bin/hipcc \
+      -DCMAKE_HIP_COMPILER=/opt/rocm/llvm/bin/clang++ \
+      -DPython3_EXECUTABLE=/usr/bin/python3 \
+      -DCMAKE_C_FLAGS="-O3 -march=znver5 -mtune=znver5 -mprefer-vector-width=512 -fPIC -pipe" \
+      -DCMAKE_CXX_FLAGS="-O3 -march=znver5 -mtune=znver5 -mprefer-vector-width=512 -fPIC -pipe" \
+      -DCMAKE_EXE_LINKER_FLAGS="-fopenmp" \
+      -DCMAKE_SHARED_LINKER_FLAGS="-fopenmp" \
+    && cmake --build build/release --parallel $(nproc) \
+    && cmake --install build/release
+
+RUN /app/install-gufo/bin/gufo --version || /app/install-gufo/bin/gufo --help | head -5
+
+# =========================================================================
+# STAGE 3: FastFlowLM Compile Stage
+# =========================================================================
+FROM ubuntu:24.04 AS flm-builder
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
+        software-properties-common libssl-dev \
+        build-essential gcc-14 g++-14 \
+        curl cmake debhelper-compat dpkg-dev fakeroot git \
+        libavcodec-dev libavformat-dev libavutil-dev \
+        libboost-dev libboost-program-options-dev \
+        libcurl4-openssl-dev libdrm-dev libfftw3-dev \
+        libreadline-dev libswresample-dev libswscale-dev \
+        nasm ninja-build patchelf pkg-config uuid-dev \
+        yasm libx264-dev libx265-dev zlib1g-dev \
+    && apt-get purge -y --autoremove libxrt1 libxrt-dev || true \
+    && add-apt-repository ppa:lemonade-team/stable -y \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+       libxrt-npu2 libxrt-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-14 100 \
+    --slave /usr/bin/g++ g++ /usr/bin/g++-14
+ENV CC=gcc-14 CXX=g++-14
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
+    && . "$HOME/.cargo/env" \
+    && rustup default stable \
+    && rustup update stable \
+    && rustup component add rustfmt clippy
+
+# Temporary blank RUSTFLAGS while installing cargo-c to avoid bitcode/LTO issues
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    . "$HOME/.cargo/env" \
+    && RUSTFLAGS="-C target-cpu=znver5" cargo install cargo-c --locked
+
+ENV RUSTFLAGS="-C opt-level=3 -C target-cpu=znver5 -C relocation-model=pic -C lto=fat -C codegen-units=1"
+
+WORKDIR /build
+COPY ./FastFlowLM /build/FastFlowLM
+WORKDIR /build/FastFlowLM
+
+RUN cmake -S src --preset linux-portable \
+    -DFLM_ENGINE_NATIVE_ARCH=ON \
+    -DFLM_BUILD_GEMMA4E=ON \
+    -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
+    -DCMAKE_C_FLAGS="-O3 -march=znver5 -mtune=znver5 -fPIC -pipe" \
+    -DCMAKE_CXX_FLAGS="-O3 -march=znver5 -mtune=znver5 -fPIC -pipe" \
+    -DCMAKE_SHARED_LINKER_FLAGS="-Wl,-O1"
+
+RUN --mount=type=cache,target=/tmp/compile_lock,sharing=locked \
+    --mount=type=cache,target=/root/.cache/ccache,sharing=shared \
+    cmake --build src/build -j$(nproc) \
+    && cmake --install src/build
+
+# =========================================================================
+# STAGE 3: Build llama-swap
+# =========================================================================
+FROM debian:trixie AS llama-swap-build
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
+        wget curl ca-certificates git make gcc g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
+    apt-get install -y nodejs
+
+COPY binaries/go1.27.3.linux-amd64.tar.gz /tmp/
+RUN tar -C /usr/local -xzf /tmp/go1.27.3.linux-amd64.tar.gz && \
+    rm /tmp/go1.27.3.linux-amd64.tar.gz
+
+ENV GOPATH=$HOME/go
+ENV PATH=$PATH:/usr/local/go/bin:$GOPATH/bin
+ENV CC=gcc CXX=g++
+
+WORKDIR /tmp/llama-swap
+COPY ./llama-swap .
+RUN --mount=type=cache,target=/tmp/compile_lock,sharing=locked \
+    --mount=type=cache,target=/root/.cache/go-build \
+    --mount=type=cache,target=/go/pkg/mod \
+    CGO_ENABLED=1 CGO_CFLAGS="-march=znver5 -O3 -mprefer-vector-width=512" \
+    GOOS=linux GOARCH=amd64 GOAMD64=v4 \
+    make clean linux-amd64 -j$(nproc)
+
+# =========================================================================
+# STAGE 4: Final Runtime
+# =========================================================================
+FROM debian:trixie-slim AS full-runtime
+SHELL ["/bin/bash", "-c"]
+
+COPY --from=rocm-tarball /opt/rocm-10.1.0 /opt/rocm-10.1.0
+RUN ln -sf /opt/rocm-10.1.0 /opt/rocm
+
+# Enable non-free + contrib
+RUN sed -i 's/Components: main/Components: main contrib non-free non-free-firmware/' /etc/apt/sources.list.d/debian.sources || \
+    echo "deb http://deb.debian.org/debian trixie main contrib non-free non-free-firmware" > /etc/apt/sources.list
+
+# Sid pin only for the few runtime libs that need the newer ABI
+RUN echo "deb http://deb.debian.org/debian/ sid main contrib non-free non-free-firmware" > /etc/apt/sources.list.d/sid.list \
+    && printf "Package: *\nPin: release a=unstable\nPin-Priority: 100\n" > /etc/apt/preferences.d/sid \
+    && printf "Package: libstdc++6 libgcc-s1 libc6\nPin: release a=unstable\nPin-Priority: 990\n" >> /etc/apt/preferences.d/sid
+
+# Single combined runtime package install + ffmpeg
+COPY binaries/ffmpeg-optimized.deb /tmp/
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        libstdc++6 libgcc-s1 libc6 \
+        libnuma1 libicu-dev \
+        libcurl4 libsndfile1 libsoxr0 \
+        libpng16-16 libjpeg62-turbo libwebp7 \
+        libatomic1 libquadmath0 libssl3 \
+        libicu76 libpng16-16t64 \
+        libboost-program-options1.83.0 \
+        libfftw3-single3 libfftw3-double3 libreadline8 \
+        libomp5-19 libgomp1 \
+        wget curl \
+    && apt-get install -y --no-install-recommends /tmp/ffmpeg-optimized.deb \
+    && rm -rf /var/lib/apt/lists/* /tmp/ffmpeg-optimized.deb
+
+# Dynamic ICU linking (alias whatever landed to .78)
+RUN ICU_LIB_PATH=$(find /usr/lib/x86_64-linux-gnu/ -name "libicuuc.so.*" | head -n 1) \
+    && ICU_I18N_PATH=$(find /usr/lib/x86_64-linux-gnu/ -name "libicui18n.so.*" | head -n 1) \
+    && ln -sf "$ICU_LIB_PATH" /usr/lib/x86_64-linux-gnu/libicuuc.so.78 \
+    && ln -sf "$ICU_I18N_PATH" /usr/lib/x86_64-linux-gnu/libicui18n.so.78
+
+ENV PATH="/opt/rocm/bin:${PATH}"
+ENV LD_LIBRARY_PATH="/opt/rocm/lib:/opt/rocm/llvm/lib:${LD_LIBRARY_PATH}"
+RUN ldconfig -v
+
+RUN mkdir -p /usr/local/bin /app
+
+# llama.cpp + sd-server (ROCm)
+RUN --mount=type=bind,from=build-rocm,source=/app/install-rocm/bin,target=/tmp/rocm-bin \
+    for file in /tmp/rocm-bin/*; do \
+        [ -f "$file" ] && cp "$file" "/usr/local/bin/$(basename "$file")-rocm"; \
+    done
+
+RUN --mount=type=bind,from=build-rocm,source=/app/install-sd-rocm/bin,target=/tmp/sd-rocm-bin \
+    for file in /tmp/sd-rocm-bin/*; do \
+        [ -f "$file" ] && cp "$file" "/usr/local/bin/$(basename "$file")-rocm"; \
+    done
+
+# Gufo
+COPY --from=build-gufo /app/install-gufo/ /usr/local/
+RUN ln -sf /usr/local/bin/gufo /usr/local/bin/gufo || true
+
+# FastFlowLM
+COPY --from=flm-builder /opt/fastflowlm /opt/fastflowlm
+RUN mv /opt/fastflowlm/flm /opt/fastflowlm/flm-real && mv /opt/fastflowlm/flm-wrapper.sh /opt/fastflowlm/flm
+
+# llama-swap
+COPY --from=llama-swap-build /tmp/llama-swap/build/llama-swap-linux-amd64 /usr/local/bin/llama-swap
+
+# Permissions
+RUN chmod +x /usr/local/bin/llama-* /usr/local/bin/sd-server-* \
+    && chmod +x /usr/local/bin/gufo \
+    && chmod +x /opt/fastflowlm/flm \
+    && chmod +x /opt/fastflowlm/flm-real \
+    && chmod +x /usr/local/bin/llama-swap
+
+# Library paths
+RUN echo '/opt/rocm-10.1.0/lib' > /etc/ld.so.conf.d/rocm.conf && \
+    echo '/opt/rocm-10.1.0/lib/llvm/lib' > /etc/ld.so.conf.d/rocm-llvm.conf && \
+    echo '/opt/fastflowlm/lib' >> /etc/ld.so.conf.d/xrt-npu.conf && \
+    ldconfig -v
+
+ENV LD_LIBRARY_PATH=/opt/rocm-10.1.0/lib:/opt/rocm-10.1.0/llvm/lib:/opt/fastflowlm/lib:${LD_LIBRARY_PATH}
+ENV PATH=/opt/rocm-10.1.0/bin:/usr/local/bin:/opt/fastflowlm:${PATH}
+ENV ROCM_PATH=/opt/rocm
+ENV HIP_PATH=/opt/rocm
+ENV FLM_XCLBIN_PATH="/opt/fastflowlm/xclbins"
+ENV FLM_CONFIG_PATH="/opt/fastflowlm/model_list.json"
+
+WORKDIR /app
+ENTRYPOINT ["llama-swap"]
+CMD ["-config", "/app/config.yaml"]
