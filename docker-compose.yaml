@@ -193,10 +193,6 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - /usr/bin/docker:/usr/bin/docker:ro
 
-      - /mnt/Data/Dockerfiles/comfyui/storage/models:/workspace/ComfyUI/models
-      - /mnt/Data/Dockerfiles/comfyui/storage/output:/workspace/ComfyUI/output
-      - /mnt/Data/Dockerfiles/comfyui/storage/input:/workspace/ComfyUI/input
-      - /mnt/Data/Dockerfiles/comfyui/storage/custom_nodes:/workspace/ComfyUI/custom_nodes
     networks:
       - app-net    
     restart: unless-stopped
